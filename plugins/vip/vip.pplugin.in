@@ -1,0 +1,997 @@
+{
+	"$schema": "https://raw.githubusercontent.com/untrustedmodders/plugify/refs/heads/main/schemas/plugin.schema.json",
+	"version": "${VIP_VERSION}",
+	"name": "vip",
+	"description": "VIP core: VIP groups (groups.ini), per-server VIP users (vip_users, the same table as the Metamod plugin so both can share one database), feature values with per-player toggles (permissions cookies, keys '<group>.<feature>'), the VIP menu and the plugin-facing IVIPApi. A port of the Metamod:Source plugin 'cs2-vip' by Pisex.",
+	"author": "Pisex, ported to Plugify",
+	"website": "https://github.com/untrustedmodders/plugify",
+	"license": "GPL-3.0",
+	"entry": "bin/vip",
+	"platforms": [],
+	"language": "cpp",
+	"dependencies": [
+		{
+			"name": "s2sdk",
+			"constraints": ">=2.18.2"
+		},
+		{
+			"name": "hudmenu",
+			"constraints": ">=1.0.0",
+			"optional": true
+		},
+		{
+			"name": "permissions",
+			"constraints": ">=1.3.1",
+			"optional": true
+		}
+	],
+	"enums": [
+		{
+			"name": "ValueType",
+			"description": "VIP_ValueType of the Pisex IVIPApi: the type of a VIP feature value.",
+			"values": [
+				{
+					"value": 0,
+					"name": "VIP_NULL",
+					"description": "No data: the feature produces no menu entry."
+				},
+				{
+					"value": 1,
+					"name": "VIP_INT",
+					"description": "Integer value."
+				},
+				{
+					"value": 2,
+					"name": "VIP_FLOAT",
+					"description": "Floating point value."
+				},
+				{
+					"value": 3,
+					"name": "VIP_BOOL",
+					"description": "Boolean value; the menu prints On/Off."
+				},
+				{
+					"value": 4,
+					"name": "VIP_STRING",
+					"description": "String value."
+				}
+			]
+		},
+		{
+			"name": "FeatureType",
+			"description": "VIP_FeatureType of the Pisex IVIPApi: how a feature appears in the VIP menu.",
+			"values": [
+				{
+					"value": 0,
+					"name": "TOGGLABLE",
+					"description": "The player can switch it on and off; the state is stored in the '<group>.<feature>' cookie."
+				},
+				{
+					"value": 1,
+					"name": "SELECTABLE",
+					"description": "Pressing it runs an action (opens a submenu); it has no state."
+				},
+				{
+					"value": 2,
+					"name": "HIDE",
+					"description": "Registered but hidden from the VIP menu."
+				}
+			]
+		},
+		{
+			"name": "ToggleState",
+			"description": "VIP_ToggleState of the Pisex IVIPApi: the state a togglable feature passes to its callback.",
+			"values": [
+				{
+					"value": 0,
+					"name": "DISABLED",
+					"description": "The feature is switched off."
+				},
+				{
+					"value": 1,
+					"name": "ENABLED",
+					"description": "The feature is switched on."
+				},
+				{
+					"value": 2,
+					"name": "NO_ACCESS",
+					"description": "Unused by the core; kept for parity with Pisex."
+				}
+			]
+		}
+	],
+	"prototypes": [
+		{
+			"name": "ItemSelectableDelegate",
+			"description": "Called when the player presses a SELECTABLE feature in the VIP menu. Return true to close the menu after the call.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "feature",
+					"type": "string",
+					"ref": false,
+					"description": "Feature name, e.g. 'FOV'."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "true = close the player menu."
+			}
+		},
+		{
+			"name": "ItemTogglableDelegate",
+			"description": "Called when the player toggles a TOGGLABLE feature. The callback may veto the change by returning true (the menu then keeps the old status) and may rewrite newStatus. The core stores the resulting state in the '<group>.<feature>' cookie itself.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "feature",
+					"type": "string",
+					"ref": false,
+					"description": "Feature name."
+				},
+				{
+					"name": "oldStatus",
+					"type": "int32",
+					"enum": "ToggleState",
+					"ref": false,
+					"description": "State before the click (ENABLED when no cookie is set)."
+				},
+				{
+					"name": "newStatus",
+					"type": "int32",
+					"enum": "ToggleState",
+					"ref": true,
+					"description": "State that would be stored; may be modified."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "true = block the change (the old status is stored)."
+			}
+		},
+		{
+			"name": "ItemDisplayDelegate",
+			"description": "Called while the VIP menu is built; a non-empty return value replaces the generated label.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot whose menu is being built."
+				},
+				{
+					"name": "feature",
+					"type": "string",
+					"ref": false,
+					"description": "Feature name."
+				}
+			],
+			"retType": {
+				"type": "string",
+				"description": "Menu label, or an empty string to keep the generated one."
+			}
+		},
+		{
+			"name": "ReadyDelegate",
+			"description": "VIP_OnVIPLoaded listener body (no arguments).",
+			"paramTypes": [],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "ClientLoadedOrDisconnectDelegate",
+			"description": "VIP_OnClientLoaded / VIP_OnClientDisconnect listener body: the VIP state of a slot after its vip_users row was read (OnClientLoaded) or when the player left (OnClientDisconnect).",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "isVIP",
+					"type": "bool",
+					"ref": false,
+					"description": "Whether the player is a VIP with a valid group at that moment."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "SpawnDelegate",
+			"description": "VIP_OnPlayerSpawn listener body; fires one frame after the player_spawn event for a living, non-bot player.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "team",
+					"type": "int32",
+					"ref": false,
+					"description": "Team number of the player's pawn."
+				},
+				{
+					"name": "isVIP",
+					"type": "bool",
+					"ref": false,
+					"description": "Whether the player is a VIP."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VipRemoveDelegate",
+			"description": "VIP_OnVIPClientRemoved listener body: reason 1 = the VIP status expired, 2 = VIP_RemoveClientVIP.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "reason",
+					"type": "int32",
+					"ref": false,
+					"description": "1 = expired, 2 = removed through the API."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VipAddDelegate",
+			"description": "VIP_OnVIPClientAdded listener body; fires after VIP_GiveClientVIP succeeded.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		}
+	],
+	"methods": [
+		{
+			"name": "VIP_IsVIPLoaded",
+			"funcName": "VIP_IsVIPLoaded",
+			"group": "core",
+			"description": "True once the database connection is up and the vip_users table exists (the bReady flag the original set after its CREATE TABLE ran). Modules that were loaded late poll this instead of waiting for VIP_OnVIPLoaded.",
+			"paramTypes": [],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the VIP core finished loading."
+			}
+		},
+		{
+			"name": "VIP_GetTranslate",
+			"funcName": "VIP_GetTranslate",
+			"group": "core",
+			"description": "Phrase from vip.phrases.txt (the g_vecPhrases map of the original). When the key is unknown an empty string is returned, exactly like the original's map lookup. Like the original, the phrase table is built once at plugin start (vip_reload only refreshes groups.ini), so a plugin may cache the value for the session.",
+			"paramTypes": [
+				{
+					"name": "phrase",
+					"type": "string",
+					"ref": false,
+					"description": "Phrase key."
+				}
+			],
+			"retType": {
+				"type": "string",
+				"description": "Translated phrase (empty when the key is missing)."
+			}
+		},
+		{
+			"name": "VIP_IsClientVIP",
+			"funcName": "VIP_IsClientVIP",
+			"group": "client",
+			"description": "VIP_IsClientVIP() of the original: the player must be a non-bot, fully authenticated client whose vip_users row exists, has not expired and names a group that exists in groups.ini.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the player currently is a VIP."
+			}
+		},
+		{
+			"name": "VIP_GetClientAccessTime",
+			"funcName": "VIP_GetClientAccessTime",
+			"group": "client",
+			"description": "Expiry of the VIP status of a slot: absolute unix timestamp, 0 = permanent, -1 = the player is not a VIP (the original returned the stored int, which is -1 for 'no row').",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "int32",
+				"description": "Expiry timestamp, 0 or -1."
+			}
+		},
+		{
+			"name": "VIP_SetClientAccessTime",
+			"funcName": "VIP_SetClientAccessTime",
+			"group": "client",
+			"description": "VIP_SetClientAccessTime() of the original: overwrites the expiry of an already VIP player (in memory and, when inDB is true, in vip_users). Fails for a player without a VIP row.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "time",
+					"type": "int32",
+					"ref": false,
+					"description": "New absolute expiry timestamp, 0 = permanent."
+				},
+				{
+					"name": "inDB",
+					"type": "bool",
+					"ref": false,
+					"description": "false = change the in-memory record only."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the change was applied."
+			}
+		},
+		{
+			"name": "VIP_GetClientVIPGroup",
+			"funcName": "VIP_GetClientVIPGroup",
+			"group": "client",
+			"description": "Name of the group the VIP row of a slot names (empty for a non-VIP).",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "string",
+				"description": "Group name or an empty string."
+			}
+		},
+		{
+			"name": "VIP_SetClientVIPGroup",
+			"funcName": "VIP_SetClientVIPGroup",
+			"group": "client",
+			"description": "VIP_SetClientVIPGroup() of the original: switches an already VIP player to another group of groups.ini (in memory and, when inDB is true, in vip_users). Fails for a non-VIP, an expired row or an unknown group.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "group",
+					"type": "string",
+					"ref": false,
+					"description": "New group name."
+				},
+				{
+					"name": "inDB",
+					"type": "bool",
+					"ref": false,
+					"description": "false = change the in-memory record only."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the change was applied."
+			}
+		},
+		{
+			"name": "VIP_GiveClientVIP",
+			"funcName": "VIP_GiveClientVIP",
+			"group": "client",
+			"description": "VIP_GiveClientVIP() of the original: gives the player a VIP status of |time| seconds (0 = permanent) in group |group|. Fails when the player already is a VIP. When addToDB is true the vip_users row is INSERTed and the player gets the Welcome/WelcomePerm message.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "time",
+					"type": "int32",
+					"ref": false,
+					"description": "Lifetime in seconds from now, 0 = permanent."
+				},
+				{
+					"name": "group",
+					"type": "string",
+					"ref": false,
+					"description": "Group name from groups.ini."
+				},
+				{
+					"name": "addToDB",
+					"type": "bool",
+					"ref": false,
+					"description": "false = change the in-memory record only."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the VIP status was granted."
+			}
+		},
+		{
+			"name": "VIP_RemoveClientVIP",
+			"funcName": "VIP_RemoveClientVIP",
+			"group": "client",
+			"description": "VIP_RemoveClientVIP() of the original: drops the VIP status of a player, optionally deletes the vip_users row and sends the VIPExpired1..3 messages. Fires VIP_OnVIPClientRemoved with reason 2 and VIP_OnClientDisconnect(slot, false).",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "notify",
+					"type": "bool",
+					"ref": false,
+					"description": "false = send no chat messages."
+				},
+				{
+					"name": "inDB",
+					"type": "bool",
+					"ref": false,
+					"description": "false = keep the vip_users row."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the VIP status was removed."
+			}
+		},
+		{
+			"name": "VIP_GetClientFeatureInt",
+			"funcName": "VIP_GetClientFeatureInt",
+			"group": "features",
+			"description": "Integer value of a feature of the player's group, honouring the '<group>.<feature>' toggle cookie: -1 when the player is not a VIP, the feature is missing, or the toggle is off (the original returned -1 in all those cases).",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "feature",
+					"type": "string",
+					"ref": false,
+					"description": "Feature name, e.g. 'jumps'."
+				}
+			],
+			"retType": {
+				"type": "int32",
+				"description": "Feature value or -1."
+			}
+		},
+		{
+			"name": "VIP_GetClientFeatureBool",
+			"funcName": "VIP_GetClientFeatureBool",
+			"group": "features",
+			"description": "Boolean value of a feature (the group value parsed with atoi, so '1' is true). false when the player is not a VIP, the feature is missing or the toggle is off.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "feature",
+					"type": "string",
+					"ref": false,
+					"description": "Feature name."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Feature value."
+			}
+		},
+		{
+			"name": "VIP_GetClientFeatureFloat",
+			"funcName": "VIP_GetClientFeatureFloat",
+			"group": "features",
+			"description": "Floating point value of a feature (the group value parsed with atof). 1.0 when the player is not a VIP, the feature is missing or the toggle is off.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "feature",
+					"type": "string",
+					"ref": false,
+					"description": "Feature name."
+				}
+			],
+			"retType": {
+				"type": "float",
+				"description": "Feature value or 1.0."
+			}
+		},
+		{
+			"name": "VIP_GetClientFeatureString",
+			"funcName": "VIP_GetClientFeatureString",
+			"group": "features",
+			"description": "String value of a feature. Empty when the player is not a VIP, the feature is missing or the toggle is off. The original returned a pointer into a thread-local buffer because a local map copy had dangled; returning the value itself makes that class of bug impossible.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "feature",
+					"type": "string",
+					"ref": false,
+					"description": "Feature name."
+				}
+			],
+			"retType": {
+				"type": "string",
+				"description": "Feature value or an empty string."
+			}
+		},
+		{
+			"name": "VIP_RegisterFeature",
+			"funcName": "VIP_RegisterFeature",
+			"group": "features",
+			"description": "VIP_RegisterFeature() of the original: registers (or replaces) a feature of the VIP menu. The core keys it by feature name; the VIP menu only shows features with valueType != VIP_NULL and featureType != HIDE that appear in the player's group. Any callback may be null.",
+			"paramTypes": [
+				{
+					"name": "feature",
+					"type": "string",
+					"ref": false,
+					"description": "Feature name, the key used in groups.ini and in the cookies."
+				},
+				{
+					"name": "valueType",
+					"type": "int32",
+					"enum": "ValueType",
+					"ref": false,
+					"description": "Type of the group value."
+				},
+				{
+					"name": "featureType",
+					"type": "int32",
+					"enum": "FeatureType",
+					"ref": false,
+					"description": "Menu behaviour."
+				},
+				{
+					"name": "select",
+					"type": "function",
+					"ref": false,
+					"prototype": "ItemSelectableDelegate",
+					"description": "SELECTABLE callback, may be null."
+				},
+				{
+					"name": "toggle",
+					"type": "function",
+					"ref": false,
+					"prototype": "ItemTogglableDelegate",
+					"description": "TOGGLABLE callback, may be null."
+				},
+				{
+					"name": "display",
+					"type": "function",
+					"ref": false,
+					"prototype": "ItemDisplayDelegate",
+					"description": "Display callback, may be null."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_IsValidVIPGroup",
+			"funcName": "VIP_IsValidVIPGroup",
+			"group": "groups",
+			"description": "True when groups.ini contains the group (VIP_IsValidVIPGroup of the original).",
+			"paramTypes": [
+				{
+					"name": "group",
+					"type": "string",
+					"ref": false,
+					"description": "Group name."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the group exists."
+			}
+		},
+		{
+			"name": "VIP_PistolRound",
+			"funcName": "VIP_PistolRound",
+			"group": "game",
+			"description": "g_bPistolRound of the original: true on the first round, when the teams switch at the round reset and on a game restart (updated on round_prestart).",
+			"paramTypes": [],
+			"retType": {
+				"type": "bool",
+				"description": "Whether this is a pistol round."
+			}
+		},
+		{
+			"name": "VIP_WarmupPeriod",
+			"funcName": "VIP_WarmupPeriod",
+			"group": "game",
+			"description": "m_bWarmupPeriod of the game rules.",
+			"paramTypes": [],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the server is in warmup."
+			}
+		},
+		{
+			"name": "VIP_GetTotalRounds",
+			"funcName": "VIP_GetTotalRounds",
+			"group": "game",
+			"description": "m_totalRoundsPlayed of the game rules (0 before the first game rules object exists).",
+			"paramTypes": [],
+			"retType": {
+				"type": "int32",
+				"description": "Rounds played."
+			}
+		},
+		{
+			"name": "VIP_SetClientCookie",
+			"funcName": "VIP_SetClientCookie",
+			"group": "cookies",
+			"description": "Stores a per-player setting under the key '<group>.<name>' in the official permissions plugin (the ICookiesApi of the original, same keys). Returns false when the player is not a VIP or the permissions plugin is unavailable.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "name",
+					"type": "string",
+					"ref": false,
+					"description": "Cookie name (a feature name)."
+				},
+				{
+					"name": "data",
+					"type": "string",
+					"ref": false,
+					"description": "Value to store."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the cookie was stored."
+			}
+		},
+		{
+			"name": "VIP_GetClientCookie",
+			"funcName": "VIP_GetClientCookie",
+			"group": "cookies",
+			"description": "Reads the '<group>.<name>' permission cookie of the player. Empty when it is unset, the player is not a VIP or the permissions plugin is unavailable.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "name",
+					"type": "string",
+					"ref": false,
+					"description": "Cookie name (a feature name)."
+				}
+			],
+			"retType": {
+				"type": "string",
+				"description": "Stored value or an empty string."
+			}
+		},
+		{
+			"name": "VIP_PrintToCenter",
+			"funcName": "VIP_PrintToCenter",
+			"group": "output",
+			"description": "PrintToCenter of the original (the utils PrintToCenter). The variadic printf of the original cannot cross the boundary, so the caller formats first - the consumer wrapper keeps the variadic signature and does exactly that.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "msg",
+					"type": "string",
+					"ref": false,
+					"description": "Message, already formatted."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OpenMenu",
+			"funcName": "VIP_OpenMenu",
+			"group": "menus",
+			"description": "Opens the VIP menu of a player (the ShowVIPMenu of the original, bReopen = true). Does nothing for a player without access.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnVIPLoaded_Register",
+			"funcName": "VIP_OnVIPLoaded_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) VIP_OnVIPLoaded listener of the calling plugin; registering again replaces it. Fires once when the database is up and the vip_users table exists.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "ReadyDelegate",
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnVIPLoaded_Unregister",
+			"funcName": "VIP_OnVIPLoaded_Unregister",
+			"group": "callbacks",
+			"description": "Removes the VIP_OnVIPLoaded listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "ReadyDelegate",
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnClientLoaded_Register",
+			"funcName": "VIP_OnClientLoaded_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) VIP_OnClientLoaded listener of the calling plugin. Fires after the vip_users row of a player was read - for connect loads and for manual reloads - and again when the permissions user (with the cookies) has been loaded.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "ClientLoadedOrDisconnectDelegate",
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnClientLoaded_Unregister",
+			"funcName": "VIP_OnClientLoaded_Unregister",
+			"group": "callbacks",
+			"description": "Removes the VIP_OnClientLoaded listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "ClientLoadedOrDisconnectDelegate",
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnClientDisconnect_Register",
+			"funcName": "VIP_OnClientDisconnect_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) VIP_OnClientDisconnect listener of the calling plugin. Fires when a player that was seen to be a VIP disconnects, and from VIP_RemoveClientVIP with isVIP = false.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "ClientLoadedOrDisconnectDelegate",
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnClientDisconnect_Unregister",
+			"funcName": "VIP_OnClientDisconnect_Unregister",
+			"group": "callbacks",
+			"description": "Removes the VIP_OnClientDisconnect listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "ClientLoadedOrDisconnectDelegate",
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnPlayerSpawn_Register",
+			"funcName": "VIP_OnPlayerSpawn_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) VIP_OnPlayerSpawn listener of the calling plugin. Fires one frame after player_spawn for a living, non-bot player.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "SpawnDelegate",
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnPlayerSpawn_Unregister",
+			"funcName": "VIP_OnPlayerSpawn_Unregister",
+			"group": "callbacks",
+			"description": "Removes the VIP_OnPlayerSpawn listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "SpawnDelegate",
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnVIPClientRemoved_Register",
+			"funcName": "VIP_OnVIPClientRemoved_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) VIP_OnVIPClientRemoved listener of the calling plugin. Fires when the VIP status of a player ends (reason 1 = expired by the per-second check, 2 = VIP_RemoveClientVIP).",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "VipRemoveDelegate",
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnVIPClientRemoved_Unregister",
+			"funcName": "VIP_OnVIPClientRemoved_Unregister",
+			"group": "callbacks",
+			"description": "Removes the VIP_OnVIPClientRemoved listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "VipRemoveDelegate",
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnVIPClientAdded_Register",
+			"funcName": "VIP_OnVIPClientAdded_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) VIP_OnVIPClientAdded listener of the calling plugin. Fires after VIP_GiveClientVIP succeeded.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "VipAddDelegate",
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "VIP_OnVIPClientAdded_Unregister",
+			"funcName": "VIP_OnVIPClientAdded_Unregister",
+			"group": "callbacks",
+			"description": "Removes the VIP_OnVIPClientAdded listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": "VipAddDelegate",
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		}
+	]
+}
