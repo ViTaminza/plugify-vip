@@ -5,8 +5,9 @@
         /* engine binding slots (defined by s2sdk_bindings, filled by the plugify module) */
         __s2sdk_*;
 
-        /* hudmenu binding slots (defined by hudmenu_bindings through pisexcompat, filled by the
-           plugify module from the hudmenu plugin's exported GetClientMenuType/SetClientMenuType) */
+        /* hudmenu binding slots (defined by hudmenu_bindings, filled by the plugify module from
+           the hudmenu plugin's exported GetClientMenuType/SetClientMenuType) - the optional
+           player's own menu type */
         __hudmenu_*;
 
         /* permissions binding slots (defined by permissions_bindings, filled by the plugify module

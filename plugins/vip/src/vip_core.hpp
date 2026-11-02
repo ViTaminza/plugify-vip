@@ -72,6 +72,7 @@ struct VipIdentity {
 
 // --- async load result (CheckVIP() / mm_reload_vip of the original) ---------------
 struct VipLoadOutcome {
+	bool failed = false;       // the read did not answer (connection lost, table missing, ...)
 	bool row_found = false;    // a vip_users row was read
 	bool expired = false;      // ... but its `expires` has passed (0 = permanent is never expired)
 	bool row_deleted = false;  // the expired row was DELETEed (what the original did)
@@ -134,7 +135,7 @@ public:
 	const Config& GetConfig() const { return m_config; }
 
 	// LoadVips() of the original: replaces the group table and drops every per-slot feature
-	// cache. The plugin parses groups.ini with the pisexcompat KeyValues parser and hands the
+	// cache. The plugin parses groups.ini with its own KV1 reader (src/kv1.hpp) and hands the
 	// table over; server_id is part of Config.
 	void SetGroups(GroupTable groups);
 	const GroupTable& Groups() const { return m_groups; }
@@ -146,6 +147,10 @@ public:
 	// primary key) when it does not exist. Blocking: startup only. Throws std::runtime_error on
 	// failure so the plugin can fail soft.
 	void CreateSchema();
+	// The non-blocking form, used by the plugin's startup retry: a database that is not up yet
+	// must not stall the game thread for the connect timeout. |done| runs from Poll() with the
+	// lifetime guard of Query().
+	void CreateSchemaAsync(std::function<void(bool ok, const std::string& error)> done);
 
 	// --- clock -------------------------------------------------------------------------
 	// Overridable so tests can force expiry without sleeping.

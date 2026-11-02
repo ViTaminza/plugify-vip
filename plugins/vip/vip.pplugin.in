@@ -2,7 +2,7 @@
 	"$schema": "https://raw.githubusercontent.com/untrustedmodders/plugify/refs/heads/main/schemas/plugin.schema.json",
 	"version": "${VIP_VERSION}",
 	"name": "vip",
-	"description": "VIP core: VIP groups (groups.ini), per-server VIP users (vip_users, the same table as the Metamod plugin so both can share one database), feature values with per-player toggles (permissions cookies, keys '<group>.<feature>'), the VIP menu and the plugin-facing IVIPApi. A port of the Metamod:Source plugin 'cs2-vip' by Pisex.",
+	"description": "VIP core: VIP groups (groups.ini), per-server VIP users (vip_users, the same table as the Metamod plugin so both can share one database), feature values with per-player toggles (permissions cookies, keys '<group>.<feature>'), the VIP menu and the plugin-facing IVIPApi. A port of the Metamod:Source plugin 'cs2-vip' by Pisex. Pure s2sdk: no pisexcompat and no wrapper libraries; plgdb is the only shared helper library (asynchronous MySQL/SQLite), permissions (the cookie store) and hudmenu (the player's own menu type) are optional plugin APIs.",
 	"author": "Pisex, ported to Plugify",
 	"website": "https://github.com/untrustedmodders/plugify",
 	"license": "GPL-3.0",

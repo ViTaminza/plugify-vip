@@ -8,10 +8,17 @@
 #                     s2sdk_bindings / permissions_bindings), never into the producer.
 #   plugify-vip       the plugin shared library (entry "bin/vip")
 #
-# The consumer side of the API (plugins/vip/include) is generated from vip.pplugin by
-# bin/plugify-gen; see API.md.
+# Pure s2sdk (docs/PLUGIN_STANDARD.md §7): no pisexcompat, no guard library, no wrapper library.
+# The allowed helper library is libs/plgdb (asynchronous MySQL/SQLite), and hudmenu/permissions are
+# OPTIONAL plugin APIs compiled in as their ordinary binding globals - never a shared wrapper.
+#
+# The __s2sdk_* / __permissions_* / __hudmenu_* binding globals have to be compiled into every
+# plugin; the root CMakeLists builds them as the object libraries s2sdk_bindings /
+# permissions_bindings / hudmenu_bindings. The standalone fallbacks below are for a configure that
+# only includes this directory (tools/export/export_plugin.py); they are named differently on
+# purpose, so they can never collide with the root targets.
 
-set(VIP_VERSION "1.2.5")
+set(VIP_VERSION "1.2.7")
 
 # --- the manifest the plugin ships (version substituted at configure time) --------
 set(VIP_PPLUGIN "${CMAKE_CURRENT_BINARY_DIR}/vip.pplugin")
@@ -22,8 +29,8 @@ configure_file(
 
 # --- generated consumer bindings --------------------------------------------------
 # plugify-gen writes <output>/external/plugify/include/<name>/..., the same layout the
-# admin_system plugin uses; include/external/plugify/include is therefore the include root of
-# the generated consumer API and include/vip_api.hpp (hand written) sits next to it.
+# admin_system plugin uses; include/external/plugify/include is therefore the include root of the
+# generated consumer API and include/vip_api.hpp (hand written) sits next to it.
 set(VIP_INCLUDE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/include/external/plugify/include")
 set(VIP_BINDINGS_CPP "${VIP_INCLUDE_ROOT}/vip/vip.cpp")
 
@@ -56,90 +63,159 @@ if(EXISTS "${VIP_BINDINGS_CPP}")
     set(VIP_BINDINGS_OBJECTS "$<TARGET_OBJECTS:vip_bindings>")
 endif()
 
-# Modules consume the API with:
-#     target_include_directories(my_module SYSTEM PRIVATE
-#             "${CMAKE_SOURCE_DIR}/plugins/vip/include"
-#             "${CMAKE_SOURCE_DIR}/plugins/vip/include/external/plugify/include"
-#             "${CMAKE_SOURCE_DIR}/sdk/include")
-#     target_sources(my_module PRIVATE $<TARGET_OBJECTS:vip_bindings>)
+# --- s2sdk / permissions / hudmenu bindings (root targets first, standalone fallbacks) -------
+if(TARGET s2sdk_bindings)
+    set(VIP_S2SDK_BINDINGS "$<TARGET_OBJECTS:s2sdk_bindings>")
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/sdk/include/s2sdk/s2sdk.cpp")
+    add_library(vip_s2sdk_bindings OBJECT "${CMAKE_SOURCE_DIR}/sdk/include/s2sdk/s2sdk.cpp")
+    target_include_directories(vip_s2sdk_bindings SYSTEM PUBLIC "${CMAKE_SOURCE_DIR}/sdk/include")
+    target_compile_definitions(vip_s2sdk_bindings PUBLIC _GLIBCXX_USE_CXX11_ABI=1)
+    set(VIP_S2SDK_BINDINGS "$<TARGET_OBJECTS:vip_s2sdk_bindings>")
+else()
+    message(FATAL_ERROR "vip needs the generated s2sdk bindings (sdk/include/s2sdk/s2sdk.cpp)")
+endif()
+
+if(TARGET permissions_bindings)
+    set(VIP_PERMISSIONS_BINDINGS "$<TARGET_OBJECTS:permissions_bindings>")
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/sdk/include/permissions/permissions.cpp")
+    add_library(vip_permissions_bindings OBJECT "${CMAKE_SOURCE_DIR}/sdk/include/permissions/permissions.cpp")
+    target_include_directories(vip_permissions_bindings SYSTEM PUBLIC "${CMAKE_SOURCE_DIR}/sdk/include")
+    target_compile_definitions(vip_permissions_bindings PUBLIC _GLIBCXX_USE_CXX11_ABI=1)
+    set(VIP_PERMISSIONS_BINDINGS "$<TARGET_OBJECTS:vip_permissions_bindings>")
+else()
+    message(FATAL_ERROR "vip needs the permissions bindings (sdk/include/permissions/permissions.cpp)")
+endif()
+
+if(TARGET hudmenu_bindings)
+    set(VIP_HUDMENU_BINDINGS "$<TARGET_OBJECTS:hudmenu_bindings>")
+elseif(EXISTS "${CMAKE_SOURCE_DIR}/sdk/include/hudmenu/hudmenu.cpp")
+    add_library(vip_hudmenu_bindings OBJECT "${CMAKE_SOURCE_DIR}/sdk/include/hudmenu/hudmenu.cpp")
+    target_include_directories(vip_hudmenu_bindings SYSTEM PUBLIC "${CMAKE_SOURCE_DIR}/sdk/include")
+    target_compile_definitions(vip_hudmenu_bindings PUBLIC _GLIBCXX_USE_CXX11_ABI=1)
+    set(VIP_HUDMENU_BINDINGS "$<TARGET_OBJECTS:vip_hudmenu_bindings>")
+else()
+    message(FATAL_ERROR "vip needs the hudmenu bindings (sdk/include/hudmenu/hudmenu.cpp)")
+endif()
 
 # --- core -------------------------------------------------------------------------
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/vip_core.cpp")
-    add_library(vip_core STATIC src/vip_core.cpp)
-    target_include_directories(vip_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_link_libraries(vip_core PUBLIC plgdb)
-    target_compile_options(vip_core PRIVATE -Wall -Wextra -Werror)
-    target_compile_definitions(vip_core PUBLIC _GLIBCXX_USE_CXX11_ABI=1)
-endif()
+add_library(vip_core STATIC src/vip_core.cpp)
+target_include_directories(vip_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+target_link_libraries(vip_core PUBLIC plgdb)
+target_compile_options(vip_core PRIVATE -Wall -Wextra -Werror)
+target_compile_definitions(vip_core PUBLIC _GLIBCXX_USE_CXX11_ABI=1)
 
 # --- plugin -----------------------------------------------------------------------
 # The plugin *implements* the API directly on vip_core and never calls the generated binding
 # slots (those belong to the consumer side, filled by the plugify module inside each module
 # plugin), so only the engine binding objects it really references are linked in here:
-# s2sdk (engine access), permissions (the cookies of VIP_Get/SetClientCookie) and - through
-# pisexcompat - hudmenu (the menu type resolution).
-if(TARGET vip_core AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/plugin.cpp")
-    add_library(plugify-vip SHARED
-            src/plugin.cpp
+# s2sdk (engine access), permissions (the cookies of VIP_Get/SetClientCookie) and - optionally -
+# hudmenu (the player's own menu type).
+add_library(plugify-vip SHARED
+        src/plugin.cpp
+        src/commands.cpp
+        src/menus.cpp
+        ${VIP_S2SDK_BINDINGS}
+        ${VIP_PERMISSIONS_BINDINGS}
+        ${VIP_HUDMENU_BINDINGS}
+)
+target_include_directories(plugify-vip PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+# SYSTEM: warnings from the generated plg/s2sdk/permissions/hudmenu headers must not fail -Werror.
+target_include_directories(plugify-vip SYSTEM PRIVATE
+        "${CMAKE_SOURCE_DIR}/sdk/include"
+        "${VIP_INCLUDE_ROOT}"
+)
+target_link_libraries(plugify-vip PRIVATE
+        plugify_sdk
+        vip_core
+        -static-libstdc++ -static-libgcc
+)
+target_compile_options(plugify-vip PRIVATE -Wall -Wextra -Werror)
+target_compile_definitions(plugify-vip PRIVATE
+        _GLIBCXX_USE_CXX11_ABI=1
+        PLUGIFY_MODULE="vip"
+        PLUGIFY_IS_DEBUG=0
+        PLUGIFY_IS_RELEASE=1
+)
+set_target_properties(plugify-vip PROPERTIES OUTPUT_NAME vip)
+
+if(UNIX AND NOT APPLE)
+    target_link_options(plugify-vip PRIVATE
+            "-Wl,--version-script,${CMAKE_CURRENT_SOURCE_DIR}/sym/version_script.lds")
+endif()
+
+# --- tests -------------------------------------------------------------------------
+# Runtimes land in build/tests so ./test.sh finds them; test.sh provides MySQL via MYSQL_*.
+# The top-level CMakeLists declares PLUGIFY_PORT_TESTS *after* the plugin directories, so on a
+# first configure it is not defined here yet: default it to the same ON. An explicit
+# -DPLUGIFY_PORT_TESTS=OFF (the exported standalone build) is already in the cache and still wins.
+if(NOT DEFINED PLUGIFY_PORT_TESTS)
+    set(PLUGIFY_PORT_TESTS ON)
+endif()
+if(PLUGIFY_PORT_TESTS)
+    # vip_core_tests: the engine-independent core against SQLite ":memory:" always and against
+    # MySQL when test.sh provides MYSQL_HOST (vip_users table, VIPApi rules, expiry, features).
+    add_executable(vip_core_tests tests/vip_core_tests.cpp)
+    target_link_libraries(vip_core_tests PRIVATE vip_core plgdb -static-libstdc++ -static-libgcc)
+    target_compile_options(vip_core_tests PRIVATE -Wall -Wextra -Werror)
+    set_target_properties(vip_core_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+
+    # vip_timers_tests: the fixed-step accumulator that replaced every s2sdk timer (the 0-delay
+    # RunFrame hazard stays documented) - no engine, no s2sdk.
+    add_executable(vip_timers_tests tests/vip_timers_tests.cpp)
+    target_include_directories(vip_timers_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(vip_timers_tests PRIVATE -Wall -Wextra -Werror)
+    target_compile_definitions(vip_timers_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+    set_target_properties(vip_timers_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+
+    # vip_config_tests: the KV1 reader (groups.ini/databases.cfg/phrases), the phrase resolution
+    # and colour tags, the menu-type table and the accumulator - all engine-free.
+    add_executable(vip_config_tests tests/vip_config_tests.cpp)
+    target_include_directories(vip_config_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_compile_options(vip_config_tests PRIVATE -Wall -Wextra -Werror)
+    target_compile_definitions(vip_config_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+    set_target_properties(vip_config_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+
+    # The consumer header (plugins/vip/include/vip_api.hpp) is compiled by the modules, never by
+    # the plugin, so it gets its own smoke test against the generated bindings.
+    if(TARGET vip_bindings)
+        add_executable(vip_api_tests tests/vip_api_tests.cpp $<TARGET_OBJECTS:vip_bindings>)
+        target_include_directories(vip_api_tests SYSTEM PRIVATE
+                "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                "${VIP_INCLUDE_ROOT}"
+                "${CMAKE_SOURCE_DIR}/sdk/include")
+        target_compile_options(vip_api_tests PRIVATE -Wall -Wextra -Werror)
+        target_compile_definitions(vip_api_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+        set_target_properties(vip_api_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    endif()
+
+    # vip_runtime_tests: the plugin TU with recording __s2sdk_* fakes (tests/vip_runtime_tests.cpp
+    # includes ../src/plugin.cpp), so the real lifecycle, map gate, config loading, listeners,
+    # commands, events, spawn queue and the menu lifecycle run without an engine.
+    add_executable(vip_runtime_tests
+            tests/vip_runtime_tests.cpp
             src/commands.cpp
             src/menus.cpp
-            $<TARGET_OBJECTS:s2sdk_bindings>
-            $<TARGET_OBJECTS:permissions_bindings>
+            ${VIP_S2SDK_BINDINGS}
+            ${VIP_PERMISSIONS_BINDINGS}
+            ${VIP_HUDMENU_BINDINGS}
     )
-    target_include_directories(plugify-vip PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    # SYSTEM: warnings from the generated s2sdk/plg/permissions/pisexcompat headers must not fail
-    # -Werror on our sources.
-    target_include_directories(plugify-vip SYSTEM PRIVATE
+    target_include_directories(vip_runtime_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    # SYSTEM: warnings from the generated plg/s2sdk/permissions/hudmenu headers must not fail -Werror.
+    target_include_directories(vip_runtime_tests SYSTEM PRIVATE
             "${CMAKE_SOURCE_DIR}/sdk/include"
-            "${CMAKE_SOURCE_DIR}/libs/pisexcompat/include")
-    # The generated consumer headers of our own plugin: only the callback typedefs and the enum
-    # classes are used (the binding slots stay null in the producer).
-    target_include_directories(plugify-vip SYSTEM PRIVATE "${VIP_INCLUDE_ROOT}")
-    target_link_libraries(plugify-vip PRIVATE
+            "${VIP_INCLUDE_ROOT}"
+    )
+    target_link_libraries(vip_runtime_tests PRIVATE
+            plugify_sdk
             vip_core
-            pisexcompat
             -static-libstdc++ -static-libgcc
     )
-    target_compile_options(plugify-vip PRIVATE -Wall -Wextra -Werror)
-    target_compile_definitions(plugify-vip PRIVATE
+    target_compile_options(vip_runtime_tests PRIVATE -Wall -Wextra -Werror)
+    target_compile_definitions(vip_runtime_tests PRIVATE
             _GLIBCXX_USE_CXX11_ABI=1
             PLUGIFY_MODULE="vip"
             PLUGIFY_IS_DEBUG=0
             PLUGIFY_IS_RELEASE=1
     )
-    set_target_properties(plugify-vip PROPERTIES OUTPUT_NAME vip)
-
-    if(UNIX AND NOT APPLE)
-        target_link_options(plugify-vip PRIVATE
-                "-Wl,--version-script,${CMAKE_CURRENT_SOURCE_DIR}/sym/version_script.lds")
-    endif()
-endif()
-
-# --- tests -------------------------------------------------------------------------
-# Runtimes land in build/tests so ./test.sh finds them; test.sh provides MySQL via MYSQL_*.
-if(TARGET vip_core AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/vip_core_tests.cpp")
-    add_executable(vip_core_tests tests/vip_core_tests.cpp)
-    target_link_libraries(vip_core_tests PRIVATE vip_core plgdb -static-libstdc++ -static-libgcc)
-    target_compile_options(vip_core_tests PRIVATE -Wall -Wextra -Werror)
-    set_target_properties(vip_core_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
-endif()
-
-# The timer-safety regression test (mirrors s2sdk's TimerSystem::RunFrame loop; no engine needed).
-if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/vip_timers_tests.cpp")
-    add_executable(vip_timers_tests tests/vip_timers_tests.cpp)
-    target_compile_options(vip_timers_tests PRIVATE -Wall -Wextra -Werror)
-    set_target_properties(vip_timers_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
-endif()
-
-# The consumer header (plugins/vip/include/vip_api.hpp) is compiled by the modules, never by
-# the plugin, so it gets its own smoke test against the generated bindings.
-if(TARGET vip_bindings AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/vip_api_tests.cpp")
-    add_executable(vip_api_tests tests/vip_api_tests.cpp $<TARGET_OBJECTS:vip_bindings>)
-    target_include_directories(vip_api_tests SYSTEM PRIVATE
-            "${CMAKE_SOURCE_DIR}/plugins/vip/include"
-            "${VIP_INCLUDE_ROOT}"
-            "${CMAKE_SOURCE_DIR}/sdk/include")
-    target_compile_options(vip_api_tests PRIVATE -Wall -Wextra -Werror)
-    target_compile_definitions(vip_api_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
-    set_target_properties(vip_api_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+    set_target_properties(vip_runtime_tests PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 endif()

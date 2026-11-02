@@ -7,7 +7,9 @@ talk to it through the original's `IVIPApi` interface.
 Design and file layout follow `plugins/admin_system` (see its API.md): a manifest with plain C
 function-pointer methods, headers generated from the manifest with `bin/plugify-gen`, a
 hand-written consumer wrapper restoring the Pisex `std::function` interface, an engine-free
-static core with its own tests, and a thin s2sdk/pisexcompat glue.
+static core with its own tests, and a thin glue that calls the s2sdk API directly (no
+pisexcompat and no wrapper library - `docs/PLUGIN_STANDARD.md` §7; `libs/plgdb` is the only
+shared helper library, and `permissions`/`hudmenu` are optional plugin APIs).
 
 ## 1. Files
 
@@ -18,10 +20,14 @@ static core with its own tests, and a thin s2sdk/pisexcompat glue.
 | `include/external/plugify/include/vip/vip.cpp` | The `__vip_*` binding slots. **Must be compiled into every consumer plugin** — use the OBJECT target `vip_bindings` (see `plugins/vip/CMakeLists.txt`). |
 | `include/vip_api.hpp` | Hand-written consumer wrapper that restores the `IVIPApi` shape (`std::function` callbacks with captures, `std::string`, default arguments, `const char*` getters, the plain enums). |
 | `src/vip_core.hpp` / `.cpp` | Engine-free core (static library `vip_core`, plgdb only): groups, the vip_users table, the feature/cookie rules, expiry. |
-| `src/plugin.cpp`, `src/commands.cpp`, `src/menus.cpp` | The s2sdk/pisexcompat glue: lifecycle, listeners, the once-per-second tick, the 34 exports, the commands, the menu. |
+| `src/plugin.cpp`, `src/commands.cpp`, `src/menus.cpp` | The pure-s2sdk glue: lifecycle, the map gate, listeners, the update-driven one-second tick, the 34 exports, the commands, the native menu. |
+| `src/kv1.hpp`, `src/text.hpp`, `src/menu_type.hpp`, `src/tick_accumulator.hpp` | Engine-free helpers: the read-only Valve KeyValues reader, the cs2-menus colour tags/phrase language/printf formatting, the exact `ResolveS2sdkMenuTypeName` table, and the fixed-step accumulator that replaces every s2sdk timer. |
 | `sym/version_script.lds` | Export list of the shared library (keep in sync with the manifest). |
 | `tests/vip_core_tests.cpp` | SQLite + MySQL tests of the core (run by `./test.sh`). |
 | `tests/vip_api_tests.cpp` | Tests of the consumer wrapper with stubbed binding slots. |
+| `tests/vip_config_tests.cpp` | KV1/groups/databases/phrases parsing, colour tags, the menu-type table. |
+| `tests/vip_timers_tests.cpp` | The timer-safety regression test and the update-driven accumulator. |
+| `tests/vip_runtime_tests.cpp` | The plugin TU against recording `__s2sdk_*` fakes: map gate, listeners, commands, events, spawn queue, menu lifecycle, A7 teardown. |
 | `check.sh` | Compile check of the plugin sources inside the build image without CMake (fallback while the repository-wide configure is broken by another plugin). |
 
 `./build.sh` regenerates the bindings from the manifest with `bin/plugify-gen` (a custom target
@@ -45,10 +51,9 @@ used).
    `VIP_GetTranslate`); the wrapper converts back to the original's `const char*` pointers with
    the original's lifetimes (§5).
 5. **`VIP_GetEntitySystem()` is not exported.** The original handed out the `CGameEntitySystem*`
-   of the utils API; s2sdk 2.18.2 has no engine layout for it (pisexcompat's
-   `GetCGameEntitySystem()` returns nullptr for the same reason), and no pointer can be used
-   across the Plugify boundary anyway. `vip::VipApi::VIP_GetEntitySystem()` returns `nullptr`;
-   ported modules use the pisexcompat schema helpers / s2sdk entity functions instead.
+   of the utils API; s2sdk has no engine layout for it, and no pointer can be used across the
+   Plugify boundary anyway. `vip::VipApi::VIP_GetEntitySystem()` returns `nullptr`; ported
+   modules use the s2sdk entity/schema functions instead.
 6. **`VIP_PrintToCenter(int, const char*, ...)` is variadic** and cannot cross the boundary as
    such: the export takes the formatted string and the wrapper does the `vsnprintf` (256 bytes,
    the original's buffer).
@@ -213,7 +218,7 @@ Counted over the original's VIP modules (`g_pVIPCore->`, `g_pVIPApi->`):
 | 8 | `VIP_SetClientCookie` | feature modules (menu toggles) |
 | 8 | `VIP_PistolRound` | Healthshot, Items, BaseFunctions |
 | 8 | `VIP_OnVIPLoaded` | every module (startup work) |
-| 7 | `VIP_GetEntitySystem` | only to be replaced by s2sdk/pisexcompat entity access |
+| 7 | `VIP_GetEntitySystem` | only to be replaced by s2sdk entity access |
 | 7 | `VIP_GetClientCookie` | feature modules |
 | 6 | `VIP_IsVIPLoaded` | modules that load late |
 | 5 | `VIP_OnClientDisconnect` | RegenHP/RegenArmor, Endurance, ... |
@@ -230,8 +235,8 @@ Counted over the original's VIP modules (`g_pVIPCore->`, `g_pVIPApi->`):
 group/database/feature logic is unit-testable and the glue stays thin:
 
 * **Config** — `server_id` of groups.ini (the `sid` column). The group table itself
-  (`GroupTable`: group → feature → value) is parsed by the plugin with the pisexcompat KeyValues
-  parser (the Pisex `LoadVips()` loop, including the fact that the `server_id` value child
+  (`GroupTable`: group → feature → value) is parsed by the plugin with its own read-only KV1
+  reader (`src/kv1.hpp`; the Pisex `LoadVips()` loop, including the fact that the `server_id` value child
   becomes an empty group that `IsValidGroup` rejects) and handed to `SetGroups()`, which drops
   every per-slot feature cache like `LoadVips()` did. A groups.ini that cannot be read keeps the
   previous table (deviation: the original cleared it first and then failed).
@@ -277,11 +282,15 @@ the feature/cookie value rules, and the `legacy` chain (including the cycle guar
 
 ## 8. The engine side
 
-`src/plugin.cpp` (lifecycle, config/phrase/database loading, s2sdk listeners, the once-per-second
-tick, the core hooks, the messages and the 34 exports), `src/commands.cpp` (the commands) and
-`src/menus.cpp` (the VIP menu) port `vip.cpp` onto `vip_core` + pisexcompat.
-`package.sh` lays out the ready-to-drop package (groups.ini and vip.phrases.txt from the
-original installation, the manifest, the `.so` and a `databases.cfg` template).
+`src/plugin.cpp` (lifecycle, config/phrase/database loading, s2sdk listeners, the map gate, the
+update-driven tick, the core hooks, the messages and the 34 exports), `src/commands.cpp` (the
+commands) and `src/menus.cpp` (the native VIP menu on s2sdk menus + the optional hudmenu type)
+port `vip.cpp` onto `vip_core` + pure s2sdk. There is no pisexcompat and no s2sdk timer: the
+spawn delay, the reconcile/expiry second and the plgdb `Poll()` pump are `TickAccumulator`
+instances fed by `OnPluginUpdate(dt)`, and every deferred action revalidates SteamID64 + the
+controller entity handle (PITFALLS C9/B4/C10). `package.sh` lays out the ready-to-drop package
+(groups.ini and vip.phrases.txt from the original installation, the manifest, the `.so` and a
+`databases.cfg.example` template with no credentials - never a real `databases.cfg`).
 
 Commands (same names, same messages as the original; all console-only):
 
@@ -299,23 +308,30 @@ Flow: `OnPluginStart` reads `vip.phrases.txt`, the `vip` section of `databases.c
 entry falls back to a local SQLite file), `groups.ini`, creates the schema, registers the s2sdk
 listeners (authenticated, put-in-server, disconnect), the permissions `OnUserLoaded` listener,
 the commands and the two game events (`player_spawn`, `round_prestart`), and starts the
-one-second timer. Authentication (or the once-per-second reconcile over every human slot, which
+update-driven one-second loop. Authentication (or the once-per-second reconcile over every human slot, which
 is the reliable path on a running server) reads the `vip_users` row; the second tick expires VIPs
-(fire `VIP_OnVIPClientRemoved(1)`, print `VIPExpired1..3`, DELETE the row) and retries lost
-loads.
+(fire `VIP_OnVIPClientRemoved(1)`, print `VIPExpired1..3`, DELETE the row) and retries a load
+that did not answer (only after the previous statement answered, with a delay that doubles up to
+two minutes).
 
 Deviations of the engine side (all deliberate, the rest is parity):
 
-* `VIP_WarmupPeriod()` reads `CCSGameRules.m_bWarmupPeriod` through `pisex::SchemaOffset`
+* `VIP_WarmupPeriod()` reads `CCSGameRules.m_bWarmupPeriod` through `s2sdk::GetSchemaOffset`
   (`m_bWarmupPeriod`, `m_bSwitchingTeamsAtRoundReset`, `m_nOvertimePlaying`, `m_bGameRestart`
   for the pistol-round computation are not exposed by s2sdk 2.18.2; the offset lookup returns
   `-1` for an unknown field, so an engine update degrades to the documented default instead of
   reading a wrong address). `m_totalRoundsPlayed` uses the s2sdk accessor.
 * The Welcome message of `OnClientPutInServer` uses the tracked/engine player name instead of
   the `name` convar value of the original (same text).
-* The welcome/expiry phrases are formatted with `pisex::FormatString` before the chat call, so a
+* The welcome/expiry phrases are formatted with `vip::FormatString` before the chat call, so a
   broken phrase file cannot turn into a format-string bug at the print site (the original passed
   the translation directly as the printf format).
 * A missing `databases.cfg`/`vip` section falls back to a local SQLite file instead of failing
   the plugin (the original had no fallback and became a no-op).
+* A database that is not accepting connections **at plugin start** no longer leaves the plugin a
+  permanent no-op: the update pump retries the core (the `CREATE TABLE` runs on the plgdb worker,
+  so the game thread never blocks in a connect timeout; 10 s doubling to 60 s) and starts the
+  listeners, commands, the startup cleanup and the one-second timer once it succeeds. Modules
+  that registered `VIP_OnVIPLoaded` get their callback at that point; `VIP_IsVIPLoaded()` turns
+  true then.
 * The unported `vip_data.ini` cookie fallback (see §5).

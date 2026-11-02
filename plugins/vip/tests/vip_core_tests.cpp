@@ -337,6 +337,26 @@ void TestLoadPlayer(Fixture& f) {
 							  {static_cast<int64_t>(f.Account(4))}),
 				 "Player4");
 
+	// A Connect load whose captured name is empty (the client had no controller yet when the row
+	// was read) refreshes only lastvisit: the stored name must not be erased.
+	Exec(*f.db, "INSERT INTO vip_users (account_id, name, lastvisit, sid, `group`, expires) VALUES (?, ?, ?, ?, ?, ?)",
+		 {static_cast<int64_t>(f.Account(15)), std::string("keepme"), static_cast<int64_t>(3), static_cast<int64_t>(1),
+		  std::string("SKILL"), static_cast<int64_t>(0)});
+	VipIdentity unnamed = f.Identity(15, 0, 11);
+	unnamed.name.clear();
+	f.loads.clear();
+	f.core->LoadPlayer(11, unnamed, LoadPurpose::Connect);
+	CHECK(Wait(*f.db, [&f] { return !f.loads.empty(); }));
+	CHECK(f.loads[0].row_found);
+	CHECK(!f.loads[0].failed);
+	Drain(*f.db);
+	CHECK_EQ_STR(ScalarString(*f.db, "SELECT name FROM vip_users WHERE account_id = ?",
+							  {static_cast<int64_t>(f.Account(15))}),
+				 "keepme");
+	CHECK_EQ_INT(ScalarInt(*f.db, "SELECT lastvisit FROM vip_users WHERE account_id = ?",
+						   {static_cast<int64_t>(f.Account(15))}),
+				 f.now);
+
 	// An expired row is deleted (the DELETE of the original).
 	Exec(*f.db, "INSERT INTO vip_users (account_id, name, lastvisit, sid, `group`, expires) VALUES (?, ?, ?, ?, ?, ?)",
 		 {static_cast<int64_t>(f.Account(5)), std::string("dead"), static_cast<int64_t>(0), static_cast<int64_t>(1),
@@ -379,6 +399,38 @@ void TestLoadPlayer(Fixture& f) {
 	CHECK(Wait(*f.db, [&f] { return !f.loads.empty(); }));
 	CHECK(!f.loads[0].row_found);
 	CHECK(!f.core->IsClientVip(f.Identity(7, 0, 9), f.now));
+}
+
+void TestLoadFailure() {
+	Section("load player - failed read");
+	// A core on a database whose vip_users table was never created: the read fails, the outcome
+	// says so (the plugin clears its in-flight flag and retries with a growing delay) and no
+	// record is created. No VIP_OnClientLoaded fires for a failure.
+	plgdb::Config config;
+	config.driver = plgdb::Driver::SQLite;
+	config.sqlitePath = ":memory:";
+	std::unique_ptr<plgdb::Database> db = plgdb::Database::Create(config);
+	CHECK(db != nullptr);
+	if (db == nullptr) {
+		return;
+	}
+	vip::VipCore core(*db);
+	std::vector<VipLoadOutcome> outcomes;
+	std::vector<std::string> errors;
+	core.onLoaded = [&outcomes](int, const VipLoadOutcome& outcome, LoadPurpose) { outcomes.push_back(outcome); };
+	core.onError = [&errors](std::string_view message) { errors.emplace_back(message); };
+	VipIdentity id;
+	id.slot = 2;
+	id.account_id = 42;
+	id.name = "x";
+	core.LoadPlayer(2, id, LoadPurpose::Connect);
+	CHECK(Wait(*db, [&outcomes] { return !outcomes.empty(); }));
+	CHECK_EQ_INT(outcomes.size(), 1);
+	CHECK(outcomes[0].failed);
+	CHECK(!outcomes[0].row_found);
+	CHECK_EQ_INT(outcomes[0].account_id, 42);
+	CHECK_EQ_INT(errors.size(), 1);
+	CHECK(core.FindPlayer(42) == nullptr);
 }
 
 void TestExpiry(Fixture& f) {
@@ -574,6 +626,7 @@ void RunSuite(const plgdb::Config& config, const char* name) {
 		TestGiveAndRemove(f);
 		TestSetAccessTimeAndGroup(f);
 		TestLoadPlayer(f);
+		TestLoadFailure();
 		TestExpiry(f);
 		TestDeleteExpiredRowsAndInsert(f);
 		TestFeatureValues(f);

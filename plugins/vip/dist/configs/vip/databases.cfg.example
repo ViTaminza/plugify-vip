@@ -5,13 +5,15 @@
 		// "mysql" (share the database with the Metamod server) or "sqlite" (local file, no server).
 		"driver"	"mysql"
 
+		// Fill in the access of this server. Leave them empty and the plugin falls back to SQLite
+		// in <data>/vip/vip.sqlite3 (fail soft, docs/PLUGIN_STANDARD.md section 4).
 		"host"		"127.0.0.1"
 		"port"		"3306"
 		"user"		""
 		"pass"		""
 		"database"	"vip"
 
-		// SQLite only: relative paths are resolved against the plugin data directory.
+		// SQLite only: relative paths are resolved against the server working directory.
 		"sqlite_path"	"vip.sqlite3"
 	}
 }

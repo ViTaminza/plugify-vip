@@ -20,6 +20,9 @@ constexpr std::string_view kSelectPlayer = "SELECT `group`, `expires` FROM vip_u
 constexpr std::string_view kInsertPlayer =
 	"INSERT INTO vip_users (account_id, name, lastvisit, sid, `group`, expires) VALUES (?, ?, ?, ?, ?, ?)";
 constexpr std::string_view kUpdateVisited = "UPDATE vip_users SET name = ?, lastvisit = ? WHERE account_id = ? AND sid = ?";
+// The Connect UPDATE for a load whose name could not be read (see LoadPlayer): the stored name
+// must not be erased by an empty capture, only lastvisit is refreshed.
+constexpr std::string_view kUpdateLastVisitOnly = "UPDATE vip_users SET lastvisit = ? WHERE account_id = ? AND sid = ?";
 constexpr std::string_view kUpdateExpires = "UPDATE vip_users SET expires = ? WHERE account_id = ? AND sid = ?";
 constexpr std::string_view kUpdateGroup = "UPDATE vip_users SET `group` = ? WHERE account_id = ? AND sid = ?";
 constexpr std::string_view kDeletePlayer = "DELETE FROM vip_users WHERE account_id = ? AND sid = ?";
@@ -149,6 +152,15 @@ void VipCore::CreateSchema() {
 	if (!result.Ok()) {
 		throw std::runtime_error(std::string("vip: creating the vip_users table failed: ") + result.Error());
 	}
+}
+
+void VipCore::CreateSchemaAsync(std::function<void(bool ok, const std::string& error)> done) {
+	const std::string_view ddl = m_db.GetDriver() == plgdb::Driver::MySQL ? kCreateTableMySQL : kCreateTableSQLite;
+	Query(std::string(ddl), {}, [done = std::move(done)](const plgdb::Result& result) {
+		if (done) {
+			done(result.Ok(), result.Error());
+		}
+	});
 }
 
 bool VipCore::SlotInRange(int slot) const {
@@ -403,9 +415,13 @@ void VipCore::LoadPlayer(int slot, VipIdentity id, LoadPurpose purpose) {
 			  VipLoadOutcome outcome;
 			  outcome.account_id = account_id;
 			  if (!result.Ok()) {
-				  // No onLoaded: a statement that failed is not "not a VIP", and the plugin's
-				  // once-per-second reconcile retries the load after its timeout.
+				  // Not "not a VIP": the plugin clears its in-flight flag and retries the load after
+				  // its (growing) timeout. No VIP_OnClientLoaded fires for a failure.
+				  outcome.failed = true;
 				  ReportError("vip: reading the vip_users row failed: " + result.Error());
+				  if (onLoaded) {
+					  onLoaded(slot, outcome, purpose);
+				  }
 				  return;
 			  }
 			  if (result.RowCount() > 0) {
@@ -425,7 +441,19 @@ void VipCore::LoadPlayer(int slot, VipIdentity id, LoadPurpose purpose) {
 							});
 				  } else if (purpose == LoadPurpose::Connect) {
 					  // PARITY: UPDATE vip_users SET name = ..., lastvisit = ... (OnClientAuthorized).
-					  Query(std::string(kUpdateVisited), {name, now, static_cast<int64_t>(account_id), m_config.server_id},
+					  // The captured name can be empty: OnClientAuthenticated may fire - and the
+					  // once-per-second reconcile may see the client - before the player controller
+					  // exists, and the engine's name query refuses to answer without one. Writing
+					  // that empty value would erase the stored name of the VIP, so it refreshes
+					  // only lastvisit.
+					  plgdb::Params params;
+					  if (!name.empty()) {
+						  params.emplace_back(name);
+					  }
+					  params.emplace_back(now);
+					  params.emplace_back(static_cast<int64_t>(account_id));
+					  params.emplace_back(m_config.server_id);
+					  Query(std::string(name.empty() ? kUpdateLastVisitOnly : kUpdateVisited), std::move(params),
 							[this](const plgdb::Result& updated) {
 								if (!updated.Ok()) {
 									ReportError("vip: updating name/lastvisit failed: " + updated.Error());
